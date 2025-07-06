@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Streamlit & editor settings
+.streamlit/
+.vscode/
+
+# Virtual environment and secrets
+venv/
+.env
+
+# OS and system caches
+AppData/
+**/AppData/
+Thumbs.db
+Desktop.ini
