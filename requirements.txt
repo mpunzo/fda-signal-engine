@@ -1,4 +1,6 @@
 streamlit
 pandas
 requests
-plotly-express 
+plotly
+fuzzywuzzy[speedup]
+python-Levenshtein

@@ -4,23 +4,36 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 import plotly.express as px
+import plotly.graph_objects as go
+from fuzzywuzzy import process
+import concurrent.futures
+import logging
+from logging.handlers import RotatingFileHandler
 
 # --- CONFIG ---
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-FDA_LIMIT = 50
-TICKER_MAP_CSV = "sponsor_ticker_list.csv"
+SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK", "")
+FDA_LIMIT       = 50
+TICKER_MAP_CSV  = "sponsor_ticker_list.csv"
+RSI_PERIOD      = 7    # match ±5-day window (~7 trading days)
+EMA_SHORT       = 5
+EMA_LONG        = 20
+
+# --- LOGGING SETUP ---
+logger = logging.getLogger("fda_signal_engine")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = RotatingFileHandler("app.log", maxBytes=5_000_000, backupCount=2)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
 
 # --- UTILITIES ---
-@st.cache_data
+@st.cache_data(ttl=600)
 def load_ticker_map():
-    """
-    Load sponsor→ticker mapping from CSV, else use fallback dict.
-    CSV should have headers: sponsor,ticker
-    """
     if os.path.exists(TICKER_MAP_CSV):
         df = pd.read_csv(TICKER_MAP_CSV)
         return dict(zip(df["sponsor"], df["ticker"]))
-    # Fallback: common biotech
+    # fallback map
     return {
         "Pfizer": "PFE", "Moderna": "MRNA", "Gilead Sciences": "GILD",
         "Amgen": "AMGN", "Biogen": "BIIB", "Regeneron": "REGN",
@@ -28,136 +41,162 @@ def load_ticker_map():
         "Sarepta": "SRPT", "Roche": "RHHBY", "Novartis": "NVS"
     }
 
-def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """Calculate RSI and append as 'RSI' column."""
+def guess_ticker(sponsor: str, ticker_map: dict, threshold: int = 80) -> str | None:
+    keys = list(ticker_map.keys())
+    # fuzzy-match ignoring case
+    match, score = process.extractOne(sponsor, keys)
+    return ticker_map[match] if score >= threshold else None
+
+def compute_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> pd.DataFrame:
     delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.rolling(window=period).mean()
-    ma_down = down.rolling(window=period).mean()
-    rs = ma_up / ma_down
-    df["RSI"] = 100 - (100 / (1 + rs))
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    df["RSI"] = 100 - (100 / (1 + up.rolling(period).mean() / down.rolling(period).mean()))
     return df
 
-def plot_price_chart(df: pd.DataFrame, ticker: str):
-    """Render an interactive close-price chart for the given ticker."""
-    fig = px.line(df, x="date", y="close", title=f"{ticker} Price")
-    st.plotly_chart(fig, use_container_width=True)
+def compute_ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-# --- DATA FETCHERS ---
-def get_fda_approvals(limit: int = FDA_LIMIT) -> pd.DataFrame:
-    """Fetch recent FDA drug approvals and log the raw JSON."""
-    url = f"https://api.fda.gov/drug/drugsfda.json?limit={limit}"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        payload = res.json()
-        st.write("🔎 FDA API response:", payload.get("meta", {}))
-        items = payload.get("results", [])
-    except Exception as e:
-        st.error(f"Failed to fetch FDA data: {e}")
-        return pd.DataFrame()
-    records = []
-    for item in items:
-        sponsor = item.get("sponsor_name", "Unknown")
-        for prod in item.get("products", []):
-            records.append({
-                "drug_name": prod.get("brand_name", "Unknown"),
-                "sponsor": sponsor,
-                "approval_date": item.get("approval_date", "")
-            })
-    return pd.DataFrame(records)
-
+@st.cache_data(ttl=600)
 def get_stock_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Fetch daily bars for ticker, log JSON or errors, return DataFrame with date, close, volume."""
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
         f"{start}/{end}?adjusted=true&sort=asc&limit=30&apiKey={POLYGON_API_KEY}"
     )
     try:
-        res = requests.get(url)
-        res.raise_for_status()
+        res = requests.get(url); res.raise_for_status()
         payload = res.json()
-        st.write(f"🔎 Polygon data for {ticker}:", payload.get("results", []))
         bars = payload.get("results", [])
+        logger.info("Fetched %s bars for %s", len(bars), ticker)
     except Exception as e:
-        st.error(f"Error fetching {ticker} data: {e}")
-        return pd.DataFrame()
-    rows = [
-        {
-            "date": datetime.fromtimestamp(bar["t"] / 1000).date(),
-            "close": bar["c"],
-            "volume": bar["v"]
-        }
-        for bar in bars
-    ]
+        bars = []
+        logger.error("Error fetching %s data: %s", ticker, e)
+        st.error(f"Error fetching {ticker}: {e}")
+    rows = [{
+        "date":   datetime.fromtimestamp(b["t"] / 1000).date(),
+        "close":  b["c"],
+        "volume": b["v"]
+    } for b in bars]
     return pd.DataFrame(rows)
 
-# --- SCREENING LOGIC ---
-def flag_movers(approvals: pd.DataFrame, ticker_map: dict) -> pd.DataFrame:
-    """
-    For each approval:
-      - Map sponsor→ticker
-      - Pull 5 days before/after prices
-      - Calc RSI, filter RSI<30 & latest volume>100k
-      - Calc pct change >5%
-    """
-    flagged = []
-    for _, row in approvals.iterrows():
-        sponsor = row["sponsor"]
-        ticker = ticker_map.get(sponsor)
-        if not ticker:
-            continue
-        date_str = row["approval_date"]
-        try:
-            d = datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            continue
-        start = (d - timedelta(days=5)).strftime("%Y-%m-%d")
-        end   = (d + timedelta(days=5)).strftime("%Y-%m-%d")
-        price_df = get_stock_data(ticker, start, end)
-        if price_df.shape[0] < 15:
-            continue
-        price_df = compute_rsi(price_df)
-        latest = price_df.iloc[-1]
-        # apply RSI & volume & pct filters
-        pct_move = (latest["close"] - price_df["close"].iloc[0]) / price_df["close"].iloc[0]
-        if latest["RSI"] < 30 and latest["volume"] > 100_000 and pct_move > 0.05:
-            flagged.append({
-                "ticker":        ticker,
-                "drug":          row["drug_name"],
-                "approval_date": date_str,
-                "pct_change":    round(pct_move * 100, 2),
-                "RSI":           round(latest["RSI"], 2),
-                "volume":        int(latest["volume"])
+def get_fda_approvals(limit: int = FDA_LIMIT) -> pd.DataFrame:
+    url = f"https://api.fda.gov/drug/drugsfda.json?limit={limit}"
+    try:
+        res = requests.get(url); res.raise_for_status()
+        payload = res.json()
+        logger.info("Fetched FDA approvals: %d", limit)
+    except Exception as e:
+        logger.error("Error fetching FDA data: %s", e)
+        st.error(f"Failed to fetch FDA data: {e}")
+        return pd.DataFrame()
+    records = []
+    for item in payload.get("results", []):
+        sponsor = item.get("sponsor_name", "").strip()
+        date_str = item.get("approval_date", "")
+        for prod in item.get("products", []):
+            records.append({
+                "sponsor":       sponsor,
+                "drug_name":     prod.get("brand_name", "Unknown"),
+                "approval_date": date_str
             })
-    return pd.DataFrame(flagged)
+    return pd.DataFrame(records)
+
+def notify_slack(message: str):
+    if SLACK_WEBHOOK:
+        try:
+            requests.post(SLACK_WEBHOOK, json={"text": message})
+            logger.info("Sent Slack notification: %s", message)
+        except Exception as e:
+            logger.error("Slack notification failed: %s", e)
+
+def plot_full_chart(df: pd.DataFrame, ticker: str):
+    # assume df already has RSI
+    df["EMA5"]  = compute_ema(df["close"], EMA_SHORT)
+    df["EMA20"] = compute_ema(df["close"], EMA_LONG)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.date, y=df.close,  name="Close"))
+    fig.add_trace(go.Scatter(x=df.date, y=df.RSI,    name="RSI",    yaxis="y2"))
+    fig.add_trace(go.Scatter(x=df.date, y=df.EMA5,   name=f"EMA{EMA_SHORT}"))
+    fig.add_trace(go.Scatter(x=df.date, y=df.EMA20,  name=f"EMA{EMA_LONG}"))
+    fig.update_layout(
+        title=f"{ticker} Price & Indicators",
+        yaxis2=dict(overlaying="y", side="right", title="RSI")
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def flag_movers(df: pd.DataFrame, ticker_map: dict) -> pd.DataFrame:
+    results = []
+    # prepare start/end per row
+    df = df.assign(
+        date_obj = pd.to_datetime(df["approval_date"]),
+        start    = (pd.to_datetime(df["approval_date"]) - timedelta(days=5)).dt.strftime("%Y-%m-%d"),
+        end      = (pd.to_datetime(df["approval_date"]) + timedelta(days=5)).dt.strftime("%Y-%m-%d")
+    )
+    # parallel requests
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as exe:
+        futures = {}
+        for idx, row in df.iterrows():
+            sponsor, start, end = row["sponsor"], row["start"], row["end"]
+            ticker = ticker_map.get(sponsor) or guess_ticker(sponsor, ticker_map)
+            if not ticker:
+                continue
+            futures[exe.submit(get_stock_data, ticker, start, end)] = (idx, ticker, row)
+        for fut in concurrent.futures.as_completed(futures):
+            idx, ticker, row = futures[fut]
+            price_df = fut.result()
+            if price_df.shape[0] < RSI_PERIOD + 1:
+                continue
+            price_df = compute_rsi(price_df)
+            latest = price_df.iloc[-1]
+            pct_move = (latest["close"] - price_df["close"].iloc[0]) / price_df["close"].iloc[0]
+            # volume spike & EMA crossover
+            df20 = price_df["volume"].rolling(20).mean().iloc[-1]
+            golden = (compute_ema(price_df["close"], EMA_SHORT).iloc[-2]
+                      < compute_ema(price_df["close"], EMA_LONG).iloc[-2]
+                      and compute_ema(price_df["close"], EMA_SHORT).iloc[-1]
+                      > compute_ema(price_df["close"], EMA_LONG).iloc[-1])
+            volume_spike = latest["volume"] > 2 * (df20 or 0)
+            if all([
+                latest["RSI"] < 30,
+                latest["volume"] > 100_000,
+                pct_move > 0.05,
+                golden, volume_spike
+            ]):
+                results.append({
+                    "ticker":        ticker,
+                    "drug":          row["drug_name"],
+                    "approval_date": row["approval_date"],
+                    "pct_change":    round(pct_move * 100, 2),
+                    "RSI":           round(latest["RSI"], 2),
+                    "volume":        int(latest["volume"])
+                })
+    return pd.DataFrame(results)
 
 # --- STREAMLIT UI ---
 st.title("💊 FDA Catalyst Trading Signal Engine")
-st.write("Flags biotech stocks with RSI<30, volume>100k & >5% price move around approval.")
+st.write("Flags biotech stocks with RSI<30, volume>100k, golden-cross & >5% price move.")
 
 if st.button("Run Screener"):
-    # 1. load & fetch data
     ticker_map = load_ticker_map()
     fda_df     = get_fda_approvals()
     if fda_df.empty:
         st.warning("No FDA data to screen.")
     else:
         movers = flag_movers(fda_df, ticker_map)
-
         if not movers.empty:
-            st.success(f"📈 Found {len(movers)} candidate(s)!")
+            st.success(f"📈 {len(movers)} candidate(s) found!")
             st.dataframe(movers)
-
-            # visualize each
+            # Slack alert
+            notify_slack(f"FDA signals: {movers['ticker'].tolist()}")
+            # CSV download
+            csv = movers.to_csv(index=False)
+            st.download_button("Download signals as CSV", csv, "signals.csv")
+            # Plot each
             for _, m in movers.iterrows():
                 st.markdown(f"### {m['ticker']} — {m['drug']} (±5d around {m['approval_date']})")
-                # re-fetch prices for chart
-                d = datetime.strptime(m["approval_date"], "%Y-%m-%d")
-                start = (d - timedelta(days=5)).strftime("%Y-%m-%d")
-                end   = (d + timedelta(days=5)).strftime("%Y-%m-%d")
-                chart_df = get_stock_data(m["ticker"], start, end)
-                plot_price_chart(chart_df, m["ticker"])
+                start = (datetime.fromisoformat(m["approval_date"]) - timedelta(days=5)).strftime("%Y-%m-%d")
+                end   = (datetime.fromisoformat(m["approval_date"]) + timedelta(days=5)).strftime("%Y-%m-%d")
+                price_df = get_stock_data(m["ticker"], start, end)
+                if not price_df.empty:
+                    plot_full_chart(price_df, m["ticker"])
         else:
             st.warning("No significant movers found today.")
