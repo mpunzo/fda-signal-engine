@@ -43,7 +43,6 @@ def load_ticker_map():
 
 def guess_ticker(sponsor: str, ticker_map: dict, threshold: int = 80) -> str | None:
     keys = list(ticker_map.keys())
-    # fuzzy-match ignoring case
     match, score = process.extractOne(sponsor, keys)
     return ticker_map[match] if score >= threshold else None
 
@@ -64,13 +63,12 @@ def get_stock_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     )
     try:
         res = requests.get(url); res.raise_for_status()
-        payload = res.json()
-        bars = payload.get("results", [])
+        bars = res.json().get("results", [])
         logger.info("Fetched %s bars for %s", len(bars), ticker)
     except Exception as e:
         bars = []
         logger.error("Error fetching %s data: %s", ticker, e)
-        st.error(f"Error fetching {ticker}: {e}")
+        # no st.error here in worker thread
     rows = [{
         "date":   datetime.fromtimestamp(b["t"] / 1000).date(),
         "close":  b["c"],
@@ -109,7 +107,6 @@ def notify_slack(message: str):
             logger.error("Slack notification failed: %s", e)
 
 def plot_full_chart(df: pd.DataFrame, ticker: str):
-    # assume df already has RSI
     df["EMA5"]  = compute_ema(df["close"], EMA_SHORT)
     df["EMA20"] = compute_ema(df["close"], EMA_LONG)
     fig = go.Figure()
@@ -125,13 +122,11 @@ def plot_full_chart(df: pd.DataFrame, ticker: str):
 
 def flag_movers(df: pd.DataFrame, ticker_map: dict) -> pd.DataFrame:
     results = []
-    # prepare start/end per row
     df = df.assign(
         date_obj = pd.to_datetime(df["approval_date"]),
         start    = (pd.to_datetime(df["approval_date"]) - timedelta(days=5)).dt.strftime("%Y-%m-%d"),
         end      = (pd.to_datetime(df["approval_date"]) + timedelta(days=5)).dt.strftime("%Y-%m-%d")
     )
-    # parallel requests
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as exe:
         futures = {}
         for idx, row in df.iterrows():
@@ -140,6 +135,7 @@ def flag_movers(df: pd.DataFrame, ticker_map: dict) -> pd.DataFrame:
             if not ticker:
                 continue
             futures[exe.submit(get_stock_data, ticker, start, end)] = (idx, ticker, row)
+
         for fut in concurrent.futures.as_completed(futures):
             idx, ticker, row = futures[fut]
             price_df = fut.result()
@@ -148,32 +144,39 @@ def flag_movers(df: pd.DataFrame, ticker_map: dict) -> pd.DataFrame:
             price_df = compute_rsi(price_df)
             latest = price_df.iloc[-1]
             pct_move = (latest["close"] - price_df["close"].iloc[0]) / price_df["close"].iloc[0]
+
             # volume spike & EMA crossover
             df20 = price_df["volume"].rolling(20).mean().iloc[-1]
-            golden = (compute_ema(price_df["close"], EMA_SHORT).iloc[-2]
-                      < compute_ema(price_df["close"], EMA_LONG).iloc[-2]
-                      and compute_ema(price_df["close"], EMA_SHORT).iloc[-1]
-                      > compute_ema(price_df["close"], EMA_LONG).iloc[-1])
+            ema_short = compute_ema(price_df["close"], EMA_SHORT)
+            ema_long  = compute_ema(price_df["close"], EMA_LONG)
+            golden    = ema_short.iloc[-2] < ema_long.iloc[-2] and ema_short.iloc[-1] > ema_long.iloc[-1]
             volume_spike = latest["volume"] > 2 * (df20 or 0)
-            if all([
-                latest["RSI"] < 30,
-                latest["volume"] > 100_000,
-                pct_move > 0.05,
-                golden, volume_spike
-            ]):
+
+            # check any conditions and record which
+            conditions = {
+                "RSI<30":      latest["RSI"] < 30,
+                "Vol>100k":    latest["volume"] > 100_000,
+                "Pct>5%":      pct_move > 0.05,
+                "GoldenCross": golden,
+                "VolSpike":    volume_spike
+            }
+            triggered = [name for name, ok in conditions.items() if ok]
+            if triggered:
                 results.append({
                     "ticker":        ticker,
                     "drug":          row["drug_name"],
                     "approval_date": row["approval_date"],
                     "pct_change":    round(pct_move * 100, 2),
                     "RSI":           round(latest["RSI"], 2),
-                    "volume":        int(latest["volume"])
+                    "volume":        int(latest["volume"]),
+                    "triggers":      ", ".join(triggered)
                 })
+
     return pd.DataFrame(results)
 
 # --- STREAMLIT UI ---
 st.title("💊 FDA Catalyst Trading Signal Engine")
-st.write("Flags biotech stocks with RSI<30, volume>100k, golden-cross & >5% price move.")
+st.write("Flags biotech stocks that meet ANY of: RSI<30, volume>100k, golden-cross, >5% price move.")
 
 if st.button("Run Screener"):
     ticker_map = load_ticker_map()
@@ -185,18 +188,16 @@ if st.button("Run Screener"):
         if not movers.empty:
             st.success(f"📈 {len(movers)} candidate(s) found!")
             st.dataframe(movers)
-            # Slack alert
             notify_slack(f"FDA signals: {movers['ticker'].tolist()}")
-            # CSV download
             csv = movers.to_csv(index=False)
             st.download_button("Download signals as CSV", csv, "signals.csv")
-            # Plot each
             for _, m in movers.iterrows():
                 st.markdown(f"### {m['ticker']} — {m['drug']} (±5d around {m['approval_date']})")
                 start = (datetime.fromisoformat(m["approval_date"]) - timedelta(days=5)).strftime("%Y-%m-%d")
                 end   = (datetime.fromisoformat(m["approval_date"]) + timedelta(days=5)).strftime("%Y-%m-%d")
                 price_df = get_stock_data(m["ticker"], start, end)
                 if not price_df.empty:
+                    price_df = compute_rsi(price_df)
                     plot_full_chart(price_df, m["ticker"])
         else:
             st.warning("No significant movers found today.")
